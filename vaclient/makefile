@@ -1,8 +1,8 @@
 CFLAGS= -DHAVE_VA_X11 -g -DMULTI_PROCESS -DPUT_XWINDOW
-LDFLAGS= -lva -lva-glx -lX11 -lglut -lGL -lpthread -lva-x11
+LDFLAGS= -lva -lva-glx -lX11 -lglut -lGL -lpthread -lva-x11 -lGLU
 SRC=$(wildcard ./*.c)
 OBJ=$(patsubst %.c,%.o,$(SRC))
-TARGET=demo
+TARGET=vaclient
 All:$(TARGET)
 
 $(TARGET):$(OBJ)

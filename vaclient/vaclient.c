@@ -29,84 +29,57 @@ if (va_status != VA_STATUS_SUCCESS) {                                   \
 #define WIN_WIDTH  (CLIP_WIDTH<<1)
 #define WIN_HEIGHT (CLIP_HEIGHT<<1)
 
-#define FIFO "/tmp/fifo"
-
-extern glmake(Display* display, int width, int height);
-extern void glswap();
-extern void glrelease();
-
 void* glsurface;
-int texture_id;
+int   texture_id;
 
-Display *x11_display;
-Window win;
-GC context;
+Display              *x11_display;
+Window               root;
+Window               win;
+GLint                att[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
+GC                   context;
+XSetWindowAttributes swa;
+XVisualInfo          *vi;
+Pixmap               pixmap;
+int                  pixmap_width = WIN_WIDTH, pixmap_height = WIN_HEIGHT;
+GC                   gc;
+GLXContext           glc;
 
-VASurfaceID surface_id;
-VAEntrypoint entrypoints[5];
-int num_entrypoints,vld_entrypoint;
-VAConfigAttrib attrib;
-VAConfigID config_id;
+typedef void (*t_glx_bind)(Display *, GLXDrawable, int , const int *);
+typedef void (*t_glx_release)(Display *, GLXDrawable, int);
+t_glx_bind glXBindTexImageEXT = 0;
+t_glx_release glXReleaseTexImageEXT = 0;
 
-VAContextID context_id;
-VABufferID pic_param_buf,iqmatrix_buf,slice_param_buf,slice_data_buf;
-int major_ver, minor_ver;
-VADisplay	va_dpy;
-VAStatus va_status;
-
-int kk,entrycnt=0;
-pthread_mutex_t surface_mutex;
-
-/*
-union semun {
-  int             val;
-  struct semid_ds *buf;
-  unsigned short  *array;
+const int pixmap_config[] = {
+    GLX_BIND_TO_TEXTURE_RGBA_EXT, True,
+    GLX_DRAWABLE_TYPE, GLX_PIXMAP_BIT,
+    GLX_BIND_TO_TEXTURE_TARGETS_EXT, GLX_TEXTURE_2D_BIT_EXT,
+    GLX_DOUBLEBUFFER, False,
+    GLX_Y_INVERTED_EXT, GLX_DONT_CARE,
+    None
 };
 
-static int semaphore_p(int sem_id) {
-    struct sembuf sem_b;
-    sem_b.sem_num = 0;
-    sem_b.sem_op = -1;
-    sem_b.sem_flg = SEM_UNDO;
-    if(semop(sem_id, &sem_b, 1) == -1)
-    {
-        fprintf(stderr, "semaphore_p failed\n");
-        return 0;
-    }
-    return 1;
-}
+const int pixmap_attribs[] = {
+    GLX_TEXTURE_TARGET_EXT, GLX_TEXTURE_2D_EXT,
+    GLX_TEXTURE_FORMAT_EXT, GLX_TEXTURE_FORMAT_RGB_EXT,
+    None
+};
 
-static int semaphore_v(int sem_id) {
-    struct sembuf sem_b;
-    sem_b.sem_num = 0;
-    sem_b.sem_op = 1;//P()
-    sem_b.sem_flg = SEM_UNDO;
-    if(semop(sem_id, &sem_b, 1) == -1)
-    {
-        fprintf(stderr, "semaphore_v failed\n");
-        return 0;
-    }
-    return 1;
-}
+GLXPixmap glxpixmap = 0;
+GLXFBConfig * configs = 0;
 
-static int set_semvalue(int sem_id, int value) {
-    union semun sem_union;
-    sem_union.val = value;
-    if(semctl(sem_id, 0, SETVAL, sem_union) == -1)
-        return 0;
-    return 1;
-}
+/**** VA *****/
+VASurfaceID    surface_id;
+VAEntrypoint   entrypoints[5];
+int            num_entrypoints,vld_entrypoint;
+VAConfigAttrib attrib;
+VAConfigID     config_id;
+VAContextID    context_id;
+VABufferID     pic_param_buf,iqmatrix_buf,slice_param_buf,slice_data_buf;
+int            major_ver, minor_ver;
+VADisplay      va_dpy;
+VAStatus       va_status;
 
-static void del_semvalue(int sem_id) {
-    union semun sem_union;
-    sem_union.val = 0;
-
-    if(semctl(sem_id, 0, IPC_RMID, sem_union) == -1)
-        fprintf(stderr, "Failed to delete semaphore\n");
-}
-*/
-
+int kk,entrycnt=0;
 
 static void *open_display(void) {
     return XOpenDisplay(NULL);
@@ -116,78 +89,181 @@ static void close_display(void *win_display) {
     XCloseDisplay(win_display);
 }
 
+
+static void Redraw() {
+    XWindowAttributes  gwa;
+
+    XGetWindowAttributes(x11_display, win, &gwa);
+    glViewport(0, 0, gwa.width, gwa.height);
+    glClearColor(0.3, 0.3, 0.3, 1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-1.25, 1.25, -1.25, 1.25, 1., 20.);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    gluLookAt(0., 0., 10., 0., 0., 0., 0., 1., 0.);
+
+    glColor3f(1.0, 1.0, 1.0);
+
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0, 0.0); glVertex3f(-1.0,  1.0, 0.0);
+    glTexCoord2f(1.0, 0.0); glVertex3f( 1.0,  1.0, 0.0);
+    glTexCoord2f(1.0, 1.0); glVertex3f( 1.0, -1.0, 0.0);
+    glTexCoord2f(0.0, 1.0); glVertex3f(-1.0, -1.0, 0.0);
+    glEnd();
+
+    glXSwapBuffers(x11_display, win);
+}
+
+
 static Window create_window(void *win_display, int x, int y, int width, int height) {
-    Display *x11_display = (Display *)win_display;
-    int screen = DefaultScreen(x11_display);
-    Window root, win;
-
-    root = RootWindow(x11_display, screen);
-    win = XCreateSimpleWindow(x11_display, root, x, y, width, height,
-                              0, 0, BlackPixel(x11_display, 0));
-
-    if (win) {
-        XSizeHints sizehints;
-        sizehints.width  = width;
-        sizehints.height = height;
-        sizehints.flags = USSize;
-        XSetNormalHints(x11_display, win, &sizehints);
-        XSetStandardProperties(x11_display, win, "XWindow", "XWindow",
-                               None, (char **)NULL, 0, &sizehints);
-
-        XMapWindow(x11_display, win);
+    if(x11_display == NULL) {
+        printf("\n\tcannot open display\n\n");
+        exit(0); 
     }
-    context = XCreateGC(x11_display, win, 0, 0);
-    XSync(x11_display, False);
+
+    root = DefaultRootWindow(x11_display);
+
+    vi = glXChooseVisual(x11_display, 0, att);
+
+    if(vi == NULL) {
+        printf("\n\tno appropriate visual found\n\n");
+        exit(0);
+    }
+
+    swa.event_mask = ExposureMask | KeyPressMask;
+    swa.colormap   = XCreateColormap(x11_display, root, vi->visual, AllocNone);
+
+    win = XCreateWindow(x11_display, root, 0, 0, 600, 600, 0, vi->depth, InputOutput, vi->visual, CWEventMask  | CWColormap, &swa);
+    XMapWindow(x11_display, win);
+    XStoreName(x11_display, win, "PIXMAP TO TEXTURE");
+    glc = glXCreateContext(x11_display, vi, NULL, GL_TRUE);
+
+    if(glc == NULL) {
+        printf("\n\tcannot create gl context\n\n");
+        exit(0);
+    }
+
+    glXMakeCurrent(x11_display, win, glc);
+    glEnable(GL_DEPTH_TEST);
+
+    /* CREATE A PIXMAP AND DRAW SOMETHING */
+    pixmap = XCreatePixmap(x11_display, root, pixmap_width, pixmap_height, vi->depth);
+    gc = DefaultGC(x11_display, 0);
+
+    XSetForeground(x11_display, gc, 0x00c0c0);
+    XFillRectangle(x11_display, pixmap, gc, 0, 0, pixmap_width, pixmap_height);
+
+    XSetForeground(x11_display, gc, 0x000000);
+    XFillArc(x11_display, pixmap, gc, 15, 25, 50, 50, 0, 360*64);
+
+    XSetForeground(x11_display, gc, 0x0000ff);
+    XDrawString(x11_display, pixmap, gc, 10, 15, "PIXMAP TO TEXTURE", strlen("PIXMAP TO TEXTURE"));
+
+    XSetForeground(x11_display, gc, 0xff0000);
+    XFillRectangle(x11_display, pixmap, gc, 75, 75, 45, 35);
+
+    XFlush(x11_display);
+
     return win;
 }
 
 void* render(void* param) {
-  pthread_mutex_lock(&surface_mutex);
-
-#ifdef PUT_XWINDOW
   VAStatus va_status;
 
-  printf("Put va surface into x window.\n");
+  printf("Put va surface into x pixmap.\n");
   // render the temp surface, it should be same with original surface without color conversion test
-  va_status = vaPutSurface(va_dpy, surface_id, (Drawable)win,
-                           0,0,CLIP_WIDTH,CLIP_HEIGHT,
+  /////////////////////////////////
+  struct timeval start_count;
+  struct timeval end_count;
+  gettimeofday(&start_count, 0);
+  va_status = vaPutSurface(va_dpy, surface_id, (Drawable)pixmap,
+                           0,0,CLIP_WIDTH, CLIP_HEIGHT,
                            0,0,WIN_WIDTH,WIN_HEIGHT,
                            NULL,
                            0,VA_FRAME_PICTURE);
   CHECK_VASTATUS(va_status,"vaPutSurface");
-#else
-  printf("Copy va surface into texture.\n");
+  gettimeofday(&end_count, 0);
+
+  double starttime_in_micro_sec = (start_count.tv_sec * 1000000) + start_count.tv_usec;
+  double endtime_in_micro_sec = (end_count.tv_sec * 1000000) + end_count.tv_usec;
+  double duration_in_milli_sec = (endtime_in_micro_sec - starttime_in_micro_sec) * 0.001;
+
+  printf ("\n\n");
+  printf ("****************************************************\n");
+  printf ("The duration of vaPutSurface is %d milliseconds \n", (int)duration_in_milli_sec);
+  printf ("****************************************************\n");
+  /////////////////////////////////
+
+  // Create a texture with GLX_texture_from_pixmap
+  const char * exts = glXQueryExtensionsString(x11_display, 0);
+
+  printf("Extensions: %s\n", exts);
+  if(! strstr(exts, "GLX_EXT_texture_from_pixmap"))
+  {
+      fprintf(stderr, "GLX_EXT_texture_from_pixmap not supported!\n");
+      return 1;
+  }
+
+  glXBindTexImageEXT = (t_glx_bind) glXGetProcAddress((const GLubyte *)"glXBindTexImageEXT");
+  glXReleaseTexImageEXT = (t_glx_release) glXGetProcAddress((const GLubyte *)"glXReleaseTexImageEXT");
+
+  if(!glXBindTexImageEXT || !glXReleaseTexImageEXT)
+  {
+      fprintf(stderr, "Some extension functions missing!");
+      return 1;
+  }
+
+  int c=0;
+
+  configs = glXChooseFBConfig(x11_display, 0, pixmap_config, &c);
+  if(!configs) {
+    fprintf(stderr, "No appropriate GLX FBConfig available!\n");
+    return 1;
+  }
+
+  glxpixmap = glXCreatePixmap(x11_display, configs[0], pixmap, pixmap_attribs);
+
+  gettimeofday(&start_count, 0);
   glEnable(GL_TEXTURE_2D);
-  glGenTextures(1,&texture_id);
-  printf("texture_id = %x11_display\n",texture_id);
+  glGenTextures(1, &texture_id);
   glBindTexture(GL_TEXTURE_2D, texture_id);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexImage2D(GL_TEXTURE_2D,0, GL_RGBA, CLIP_WIDTH, CLIP_HEIGHT, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glXBindTexImageEXT(x11_display, glxpixmap, GLX_FRONT_EXT, NULL);
+  glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE); 
+  gettimeofday(&end_count, 0);
 
-  va_status=vaCreateSurfaceGLX(va_dpy, GL_TEXTURE_2D, texture_id, &glsurface);
-  CHECK_VASTATUS(va_status, "vaCreateSurfaceGLX");
-  va_status=vaCopySurfaceGLX(va_dpy,glsurface,surface_id,0);
-  CHECK_VASTATUS(va_status, "vaCopySurfaceGLX");
+  starttime_in_micro_sec = (start_count.tv_sec * 1000000) + start_count.tv_usec;
+  endtime_in_micro_sec = (end_count.tv_sec * 1000000) + end_count.tv_usec;
+  duration_in_milli_sec = (endtime_in_micro_sec - starttime_in_micro_sec) * 0.001;
 
-  glEnable(GL_TEXTURE_2D);
-  glBindTexture(GL_TEXTURE_2D, texture_id);
+  printf ("\n\n");
+  printf ("****************************************************\n");
+  printf ("The duration of bind textimageext is %d milliseconds \n", (int)duration_in_milli_sec);
+  printf ("****************************************************\n");
 
-  glBegin(GL_QUADS);
-  glTexCoord2f(0, 0); glVertex2f(-1.0f, -1.0f);
-  glTexCoord2f(0, 1); glVertex2f(1.0f, -1.0f);
-  glTexCoord2f(1, 1); glVertex2f(1.0f,  1.0f);
-  glTexCoord2f(1, 0); glVertex2f(-1.0f, 1.0f);
-  glEnd();
+  XEvent     xev;
+  while(1) {
+    XNextEvent(x11_display, &xev);
 
-  glBindTexture(GL_TEXTURE_2D, 0);
-  glDisable(GL_TEXTURE_2D);
-  glswap();
-#endif
-  pthread_mutex_unlock(&surface_mutex);
+    if(xev.type == Expose) {
+      Redraw();
+    } else if(xev.type == KeyPress) {
+      glXReleaseTexImageEXT(x11_display, glxpixmap, GLX_FRONT_EXT);
+      XFree(configs);
+      XFreePixmap(x11_display, pixmap);
+
+      glXMakeCurrent(x11_display, None, NULL);
+      glXDestroyContext(x11_display, glc);
+      XDestroyWindow(x11_display, win);
+      XCloseDisplay(x11_display);
+      exit(0);
+    }
+  } /* while(1) */
 }
 
 int main(int argc,char **argv)
@@ -198,13 +274,7 @@ int main(int argc,char **argv)
        return -1;
    }
 
-   pthread_mutex_init(&surface_mutex, NULL);
-
-#ifdef PUT_XWINDOW
    win = create_window(x11_display, 0, 0, WIN_WIDTH, WIN_HEIGHT);
-#else
-   win = glmake(x11_display, WIN_WIDTH, WIN_HEIGHT);
-#endif
 
    va_dpy = vaGetDisplayGLX(x11_display);
 
@@ -349,80 +419,16 @@ int main(int argc,char **argv)
    va_status = vaSyncSurface(va_dpy, surface_id);
    CHECK_VASTATUS(va_status, "vaSyncSurface");
 
-
-
-#ifdef FORK_PROCESS
-   key_t key;
-   int sem_id;
-   pid_t p;
-   p = fork();
-
-   //key = ftok("/tmp/sem", 'a');
-   //sem_id = semget(key, 1, 0666 | IPC_CREAT);
-   //set_semvalue(sem_id, 1);
-
-   if (p > 0) {
-    //semaphore_p(sem_id);
-    printf("It's father process %d\n", getpid());
-    //semaphore_v(sem_id);
-   } else if (p == 0) {
-    //semaphore_p(sem_id);
-    printf("It's child process %d\n", getpid());
-    render(NULL);
-    //semaphore_v(sem_id);
-   }
-#elif defined(CROSS_PROCESS)
-   int ret;
-   int fd;
-   unlink(FIFO);
-   int fifo = mkfifo(FIFO, 0666);
-   if (-1 == fifo) {
-      fprintf(stderr, "Failed to create fifo.\n");
-      return -1;
-   }
-
-   fd = open(FIFO, O_WRONLY);
-   if (-1 == fd) {
-      fprintf(stderr, "Failed to open fifo.\n");
-      close(fd);
-      return -1;
-   }
-
-   void* param[3];
-   param[0] = (void*)va_dpy;
-   param[1] = (void*)surface_id;
-   param[2] = (void*)win;
-
-   printf("writing...  \nVA DISPLAY: %p surface ID: %p Window: %p\n", (void*)va_dpy, (void*)surface_id, (void*)win);
-
-   ret = write(fd, param, sizeof(param));
-   if (ret != sizeof(param)) {
-    fprintf(stderr, "Failed to write fifo.\n");
-    close(fd);
-    return -1;
-   } else {
-    printf("Write %x11_display byte.\n", ret);
-   }
-#else
    render(NULL);
-#endif
 
    printf("press any key to exit\n");
    char is_get_char = getchar();
 
-#ifndef PUT_XWINDOW
-   va_status = vaDestroySurfaceGLX(va_dpy, glsurface);
-   CHECK_VASTATUS(va_status, "vaDestroySurfaceGLX");
-
-   glDeleteTextures(1, &texture_id);
-   glrelease();
-#else
    if(win) {
      XUnmapWindow(x11_display, win);
      XDestroyWindow(x11_display, win);
      win = NULL;
    }
-#endif
 
     //vaDestroySurfaces(va_dpy,&surface_id,1);
     //vaDestroyConfig(va_dpy,config_id);

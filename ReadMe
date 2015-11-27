@@ -1,0 +1,10 @@
+# VaapiSample
+
+This sample is to test whether gl context can be used in different processes/threads.
+
+### Result
+
+Only fork() can let gl context the same.
+
+In different processes/threads, gl context can't be shared.
+
